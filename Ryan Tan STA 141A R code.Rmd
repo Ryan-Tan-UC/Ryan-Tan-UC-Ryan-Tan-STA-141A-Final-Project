@@ -1,0 +1,299 @@
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(FactoMineR)
+library(conflicted)
+
+# Resolve conflicts
+conflict_prefer("filter", "dplyr")
+conflict_prefer("lag", "dplyr")
+conflict_prefer("lift", "purrr")
+
+# Set correct directory where RDS files are located
+data_path <- "C:/Users/Hongrui/Desktop/sessions/"
+
+# Initialize session list
+session <- vector("list", 18)
+
+# Load data
+for (i in 1:18) {
+  file_name <- paste0(data_path, "session", i, ".rds")
+  if (file.exists(file_name)) {
+    session[[i]] <- readRDS(file_name)
+  } else {
+    session[[i]] <- NULL  # Mark missing sessions
+    warning(paste("Missing file:", file_name))  # Show a warning for missing files
+  }
+}
+
+# Check which sessions are NULL
+missing_sessions <- which(sapply(session, is.null))
+print(paste("Missing sessions:", paste(missing_sessions, collapse=", ")))
+
+# Part 1: Exploratory Data Analysis
+# Summarize number of trials and neurons
+valid_sessions <- session[!sapply(session, is.null)]
+
+summary_data <- data.frame(
+    session = seq_along(valid_sessions),
+    mouse = sapply(valid_sessions, function(x) x$mouse_name),
+    num_trials = sapply(valid_sessions, function(x) length(x$feedback_type)),
+    num_neurons = sapply(valid_sessions, function(x) dim(x$spks[[1]])[1])
+)
+
+print(summary_data)
+
+# Plot average firing rate for trial 11 in Session 5
+trial_spks <- session[[5]]$spks[[11]]
+avg_spks <- colMeans(trial_spks)
+time_values <- unlist(session[[5]]$time)
+min_length <- min(length(time_values), length(avg_spks))
+plot(time_values[1:min_length], avg_spks[1:min_length], type="l", xlab="Time (s)", ylab="Average Spike Count",
+     main="Average Spike Count Over Time (Session 5, Trial 11)")
+
+# Part 2: Data Integration
+# Flatten spike trains and create a combined dataset
+combined_data <- vector("list", sum(sapply(session, function(x) length(x$feedback_type))))
+counter <- 1
+for (i in 1:18) {
+    num_trials <- length(session[[i]]$feedback_type)
+    for (j in 1:num_trials) {
+        spks_flat <- as.vector(session[[i]]$spks[[j]])
+        combined_data[[counter]] <- c(
+            feedback_type = session[[i]]$feedback_type[j],
+            contrast_left = session[[i]]$contrast_left[j],
+            contrast_right = session[[i]]$contrast_right[j],
+            spks_flat
+        )
+        counter <- counter + 1
+    }
+}
+
+# Pad shorter elements with NA to match the longest one
+max_length <- max(lengths(combined_data))
+combined_data_fixed <- lapply(combined_data, function(x) {
+  length(x) <- max_length
+  return(x)
+})
+
+# Combine into a data frame
+combined_df <- do.call(rbind, combined_data_fixed)
+
+# Handle missing and infinite values
+combined_df[is.infinite(combined_df)] <- NA  # Replace infinite values with NA
+combined_df <- na.omit(combined_df)  # Remove rows with NA values
+
+# Check for zero-variance columns
+zero_var_cols <- which(apply(combined_df[, -(1:3)], 2, var) == 0)
+if (length(zero_var_cols) > 0) {
+  combined_df <- combined_df[, -(zero_var_cols + 3)]  # +3 to account for the first 3 columns
+}
+
+# Scale the data (excluding the first 3 columns)
+scaled_data <- scale(combined_df[, -(1:3)])
+
+# Check for missing or infinite values in scaled_data
+if (sum(is.na(scaled_data)) > 0 || sum(is.infinite(scaled_data)) > 0) {
+  stop("Scaled data contains missing or infinite values. Check the input data.")
+}
+
+# Apply PCA
+pca_result <- PCA(scaled_data, ncp=50, graph=FALSE)
+reduced_features <- pca_result$ind$coord
+
+# Part 3: Predictive Modeling
+# Prepare data for modeling
+model_data <- data.frame(
+    feedback_type = factor(combined_df[, 1], levels=c(-1, 1), labels=c("Negative", "Positive")),
+    contrast_left = combined_df[, 2],
+    contrast_right = combined_df[, 3],
+    reduced_features
+)
+
+# Split into training and validation sets
+set.seed(123)
+train_index <- createDataPartition(model_data$feedback_type, p=0.8, list=FALSE)
+train_data <- model_data[train_index, ]
+val_data <- model_data[-train_index, ]
+
+# Train logistic regression model
+model <- train(
+    feedback_type ~ .,
+    data = train_data,
+    method = "glm",
+    family = "binomial",
+    trControl = trainControl(method="cv", number=5)
+)
+
+# Evaluate on validation set
+pred <- predict(model, val_data)
+conf_matrix <- confusionMatrix(pred, val_data$feedback_type)
+
+# Display the model summary
+print("Model Summary:")
+print(summary(model$finalModel))
+
+# Display confusion matrix and evaluation metrics
+print("Confusion Matrix and Statistics:")
+print(conf_matrix)
+
+# Plot model performance
+# ROC curve
+library(pROC)
+prob_pred <- predict(model, val_data, type = "prob")
+roc_obj <- roc(val_data$feedback_type, prob_pred$Positive)
+plot(roc_obj, main = "ROC Curve for Feedback Type Prediction",
+     col = "blue", lwd = 2)
+text(0.6, 0.2, paste("AUC =", round(auc(roc_obj), 3)), col = "blue")
+
+# Variable importance
+if(length(model$finalModel$coefficients) <= 50) {  # Only if not too many coefficients
+  imp <- varImp(model)
+  plot(imp, top = 20, main = "Top 20 Variable Importance")
+}
+
+# Create a plot showing model predictions vs. actual values
+# Based on contrast values
+plot_data <- data.frame(
+  actual = val_data$feedback_type,
+  predicted = pred,
+  contrast_left = val_data$contrast_left,
+  contrast_right = val_data$contrast_right
+)
+
+# Plot showing prediction accuracy by contrast combination
+ggplot(plot_data, aes(x = contrast_left, y = contrast_right, color = actual == predicted)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("red", "green"), labels = c("Incorrect", "Correct"), name = "Prediction") +
+  labs(title = "Model Prediction Accuracy by Contrast Combination",
+       x = "Left Contrast",
+       y = "Right Contrast") +
+  theme_minimal()
+
+#accuracy
+accuracy <- conf_matrix$overall["Accuracy"]
+
+# Print accuracy
+print(paste("Accuracy on test set:", accuracy))
+
+#Precision Success and Failure
+precision_success <- conf_matrix$byClass["Pos Pred Value"]  # Precision for "Success"
+precision_failure <- conf_matrix$byClass["Neg Pred Value"]  # Precision for "Failure"
+
+# Print precision
+print(paste("Precision (Success):", precision_success))
+print(paste("Precision (Failure):", precision_failure))
+
+#F-1 Score
+f1_score_success <- conf_matrix$byClass["F1"]  # F1 score for "Success"
+f1_score_failure <- conf_matrix$byClass["F1"]  # F1 score for "Failure"
+
+# Print F1 score
+print(paste("F1 Score (Success):", f1_score_success))
+print(paste("F1 Score (Failure):", f1_score_failure))
+
+#Recall
+recall_success <- conf_matrix$byClass["Sensitivity"]  # Recall for "Success"
+recall_failure <- conf_matrix$byClass["Specificity"]  # Recall for "Failure"
+
+# Print recall
+print(paste("Recall (Success):", recall_success))
+print(paste("Recall (Failure):", recall_failure))
+
+#Test Data
+test1_path <- "C:/Users/Hongrui/Desktop/test1.rds"
+test2_path <- "C:/Users/Hongrui/Desktop/test2.rds"
+
+# Load the test data
+test1 <- readRDS("C:/Users/Hongrui/Desktop/test1.rds")
+test2 <- readRDS("C:/Users/Hongrui/Desktop/test2.rds")
+
+print("Data from test1.rds:")
+str(test1)
+print("Data from test2.rds:")
+
+
+# Combine test1 and test2 into a single test set (if applicable)
+test_data <- rbind(test1, test2)
+
+# Inspect the structure of test_data
+str(test_data)
+
+# Check which elements are numeric
+numeric_cols <- sapply(test_data, is.numeric)
+print(numeric_cols)
+
+# Extract numeric elements from the list
+numeric_data <- test_data[numeric_cols]
+
+# Convert the list to a data frame
+numeric_data <- as.data.frame(numeric_data)
+
+# Check for missing values
+sum(is.na(numeric_data))
+
+# Handle missing values (e.g., remove rows with NA)
+numeric_data <- na.omit(numeric_data)
+
+# Scale the numeric data
+test_scaled_data <- scale(numeric_data)
+
+# Convert test_scaled_data to a data frame
+test_scaled_data <- as.data.frame(test_scaled_data)
+
+# Ensure column names match the PCA model
+pca_columns <- rownames(pca_result$var$coord)
+
+# Check if all PCA columns exist in test_scaled_data
+missing_columns <- setdiff(pca_columns, colnames(test_scaled_data))
+if (length(missing_columns) > 0) {
+  # Add missing columns to test_scaled_data
+  for (col in missing_columns) {
+    test_scaled_data[[col]] <- NA  # Add missing columns with NA values
+  }
+}
+
+# Reorder columns to match the PCA model
+test_scaled_data <- test_scaled_data[, pca_columns]
+
+# Check if test_scaled_data is valid
+if (nrow(test_scaled_data) == 0) {
+  stop("test_scaled_data is empty. Check the input data and PCA model.")
+}
+
+# Apply the same PCA transformation used in training
+test_pca_features <- predict(pca_result, newdata = test_scaled_data)
+
+# Check if test_pca_features is valid
+if (is.null(test_pca_features) || nrow(test_pca_features) == 0) {
+  stop("PCA transformation failed. Check the input data and PCA model.")
+}
+
+# Subset test_data to match the rows in test_pca_features
+test_data_subset <- test_data[1:nrow(test_pca_features), ]
+
+# Prepare the test data for prediction
+test_model_data <- data.frame(
+    feedback_type = factor(test_data_subset$feedback_type, levels = c(-1, 1), labels = c("Negative", "Positive")),
+    contrast_left = test_data_subset$contrast_left,
+    contrast_right = test_data_subset$contrast_right,
+    test_pca_features
+)
+
+# Make predictions on the test data
+test_pred <- predict(model, newdata = test_model_data)
+
+# Evaluate performance
+conf_matrix <- confusionMatrix(test_pred, test_model_data$feedback_type)
+print(conf_matrix)
+
+
+# Calculate ROC-AUC (if applicable)
+library(pROC)
+test_prob <- predict(model, newdata = test_model_data, type = "prob")[, "Positive"]
+roc_curve <- roc(test_model_data$feedback_type, test_prob)
+auc_value <- auc(roc_curve)
+print(paste("AUC on test set:", auc_value))
+
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve for Test Set")
